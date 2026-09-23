@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tests and tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local databases (stats, cache, demo data)
+*.db
+*.sqlite
+*.sqlite3
+
+# Scrape output and saved pages
+results*.jsonl
+saved_html/
+
+# Secrets: proxy lists and env files
+.env
+.env.*
+proxies.txt
+*.proxies
+
+# Browser automation artifacts
+.playwright-mcp/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
