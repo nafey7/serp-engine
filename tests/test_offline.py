@@ -103,7 +103,7 @@ def test_related_searches_skip_pagination():
 
 
 def test_auto_tries_lite_first_and_caches(tmp_path, monkeypatch):
-    engine = _engine(tmp_path)
+    engine = _engine(tmp_path, cache_ttl_s=3600, stale_ttl_s=7 * 86400)
     monkeypatch.setattr(engine.http, "fetch_lite", _fake(LITE_PAGE))
     monkeypatch.setattr(engine.http, "fetch", _never)
     r = engine.search("x")
@@ -114,7 +114,7 @@ def test_auto_tries_lite_first_and_caches(tmp_path, monkeypatch):
     assert again.cached and again.organic == r.organic and again.related_searches == ["result c"]
     fresh = engine.search("x", no_cache=True)  # skipping the cache really asks Google
     assert "sent a request" in fresh.attempts[0].detail
-    assert [a.mode for a in fresh.attempts] == ["lite", "http", "browser"]
+    assert [a.mode for a in fresh.attempts] == ["lite", "http", "hybrid"]
     assert "must not contact Google" in fresh.attempts[2].detail
     # Every mode failed, so the saved copy comes back, flagged as stale, with the real status.
     assert fresh.stale and fresh.status == "failed" and fresh.organic == r.organic and "saved result" in fresh.note
@@ -127,7 +127,7 @@ def test_auto_falls_back_from_lite_to_http(tmp_path, monkeypatch):
     r = engine.search("x")
     assert [a.mode for a in r.attempts] == ["lite", "http"] and r.status == "ok"
     # Lite failed and has not worked since, so the next search skips it.
-    assert engine._plan("auto", False) == ["http", "browser"]
+    assert engine._plan("auto", False) == ["http", "hybrid", "browser"]
 
 
 def test_failed_searches_are_not_cached(tmp_path, monkeypatch):
@@ -240,7 +240,7 @@ def test_captcha_redirect_is_not_followed(monkeypatch):
         calls.append(url)
         return _Resp(302, "https://www.google.com/wml/search?q=x", location="https://www.google.com/sorry/index?continue=x")
 
-    monkeypatch.setattr("serp.fetch_http.requests.get", fake_get)
+    monkeypatch.setattr("serp.fetch_http._http_get", fake_get)
     got = REAL_GET(HttpFetcher(Config()), "https://www.google.com/wml/search", {"q": "x"}, DIRECT, "chrome")
     assert len(calls) == 1  # the sorry page itself was never loaded
     assert classify_block(got.status_code, got.final_url, got.html) == "captcha"
@@ -249,7 +249,7 @@ def test_captcha_redirect_is_not_followed(monkeypatch):
 def test_other_redirects_are_followed(monkeypatch):
     replies = [_Resp(301, "https://google.com/search?q=x", location="/search?q=x"),
                _Resp(200, "https://www.google.com/search?q=x", text=RESULTS_PAGE)]
-    monkeypatch.setattr("serp.fetch_http.requests.get", lambda url, **k: replies.pop(0))
+    monkeypatch.setattr("serp.fetch_http._http_get", lambda url, **k: replies.pop(0))
     got = REAL_GET(HttpFetcher(Config()), "https://google.com/search", {"q": "x"}, DIRECT, "chrome")
     assert got.status_code == 200 and classify_block(got.status_code, got.final_url, got.html) is None
 
@@ -277,7 +277,7 @@ def test_hourly_limit_frees_up_after_an_hour(tmp_path, monkeypatch):
 
 
 def test_stale_copy_is_served_while_blocked(tmp_path, monkeypatch):
-    engine = _engine(tmp_path, cache_ttl_s=60)
+    engine = _engine(tmp_path, cache_ttl_s=60, stale_ttl_s=7 * 86400)
     monkeypatch.setattr(engine.http, "fetch_lite", _fake(LITE_PAGE))
     first = engine.search("x", mode="lite")
     engine.stats._db.execute("UPDATE cache SET ts = ts - 7200")  # now past the normal cache time
@@ -295,7 +295,7 @@ def test_stale_copy_is_served_while_blocked(tmp_path, monkeypatch):
 def test_duplicate_searches_at_once_send_one_request(tmp_path, monkeypatch):
     import threading
 
-    engine = _engine(tmp_path)
+    engine = _engine(tmp_path, cache_ttl_s=3600)
     calls, gate = [], threading.Event()
 
     def slow_lite(*a, **k):
@@ -313,3 +313,202 @@ def test_duplicate_searches_at_once_send_one_request(tmp_path, monkeypatch):
     for t in threads:
         t.join()
     assert len(calls) == 1 and sorted(r.cached for r in results) == [False, True, True]
+
+
+def test_caching_is_off_by_default(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(engine.http, "fetch_lite", _fake(LITE_PAGE))
+    engine.search("x", mode="lite")
+    assert not engine.search("x", mode="lite").cached
+    assert engine.stats.summary()["cached_searches"] == 0
+
+
+@pytest.mark.parametrize("name, contains", [
+    ("hello_world_aio", ['works properly.\nWhat is a "Hello, World!" Program?', '- Python: print("Hello, World!")']),
+    ("running_shoes", ["the max-cushioned Nike Vomero 18 and the stable, plush Brooks Ghost Max 3.",
+                       "\nBrooks Ghost Max 3\nBuilt with a high-stack rocker shape"]),
+    ("sourdough", ["To make basic sourdough bread, combine 100g", "\n- Put the basket in the refrigerator"]),
+])
+def test_ai_overview_text_is_only_the_answer(name, contains):
+    html = (Path(__file__).parent / "fixtures" / f"desktop_2026-09_{name}.html").read_text()
+    aio = parse_serp(html).ai_overview
+    for text in contains:
+        assert text in aio.text
+    # Citation chips, product card details, video cards, buttons and the source panel stay out.
+    for junk in ("+1", "+2", "Add to list", "$", "Show more", "Show less", "Show all", "views ·",
+                 "Opens in new tab", "product viewer", "The 7 Best Nike Running Shoes"):
+        assert junk not in aio.text
+    assert all(s["title"] and s["site"] and "Opens in new tab" not in s["title"] for s in aio.sources)
+
+
+class _Redirect:
+    def __init__(self, location, status=302):
+        self.status_code, self.headers = status, {"location": location}
+
+
+def _browser_page(monkeypatch, engine, name="running_shoes"):
+    html = (Path(__file__).parent / "fixtures" / f"desktop_2026-09_{name}.html").read_text()
+    monkeypatch.setattr(engine, "_browser", type("B", (), {"fetch": lambda *a, **k: FetchResult(
+        status_code=200, final_url="https://www.google.com/search?q=x", html=html, elapsed_ms=1, aio_shown=True)})())
+
+
+def test_goto_links_are_resolved_and_result_is_valid(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    _browser_page(monkeypatch, engine)
+    seen = []
+
+    def fake_get(url, **k):
+        seen.append(url)
+        return _Redirect("https://site.example/" + url[-12:])
+
+    monkeypatch.setattr("serp.resolve._http_get", fake_get)
+    r = engine.search("best running shoes", mode="browser", ai_overview=True)
+    assert r.status == "ok" and r.valid and r.problems == []
+    assert all(o.url.startswith("https://site.example/") and o.domain for o in r.organic)
+    assert r.ai_overview and all(s["url"].startswith("https://site.example/") for s in r.ai_overview.sources)
+    assert len(seen) == len(set(seen))  # each coded link asked for once
+
+
+def test_unresolved_links_make_the_result_not_valid(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    _browser_page(monkeypatch, engine)
+    monkeypatch.setattr("serp.resolve._http_get", lambda url, **k: _Redirect("https://www.google.com/sorry/index"))
+    r = engine.search("best running shoes", mode="browser", ai_overview=True)
+    assert r.status == "ok" and not r.valid
+    assert any(p.startswith("unresolved_links: ") for p in r.problems)
+
+
+def test_overview_shown_but_not_parsed_is_not_valid(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(engine, "_browser", type("B", (), {"fetch": lambda *a, **k: FetchResult(
+        status_code=200, final_url="https://www.google.com/search?q=x", html=RESULTS_PAGE, elapsed_ms=1, aio_shown=True)})())
+    r = engine.search("x", mode="browser", ai_overview=True)
+    assert r.status == "ok" and not r.valid and r.problems == ["ai_overview_shown_but_not_extracted"]
+
+
+def test_search_stats_count_searches_apart_from_attempts(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(engine.http, "fetch_lite", _fake(JS_PAGE))  # lite fails, then http works
+    monkeypatch.setattr(engine.http, "fetch", _fake(RESULTS_PAGE))
+    engine.search("a")
+    engine.search("b", mode="http")
+    s = engine.stats.search_summary()
+    assert s["searches"] == 2 and s["fetch_attempts"] == 3
+    assert s["valid_rate"] == 1 and s["first_try_valid_rate"] == 0.5
+    assert s["p95_ms"] >= s["p50_ms"] >= 0
+
+
+def test_links_started_early_are_not_asked_for_again(monkeypatch):
+    from concurrent.futures import Future
+
+    from serp.resolve import resolve_links
+
+    asked = []
+    monkeypatch.setattr("serp.resolve._http_get", lambda url, **k: asked.append(url) or _Redirect("https://b.example/"))
+    early = Future()
+    early.set_result("https://a.example/")
+    a, b = "https://www.google.com/goto?url=A", "https://www.google.com/goto?url=B"
+    assert resolve_links([a, b, "https://plain.example/"], DIRECT, {a: early}) == {a: "https://a.example/", b: "https://b.example/"}
+    assert asked == [b]
+
+
+def test_overview_cut_off_by_the_wait_is_not_valid(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    html = (Path(__file__).parent / "fixtures" / "desktop_2026-09_sourdough.html").read_text()
+    monkeypatch.setattr(engine, "_browser", type("B", (), {"fetch": lambda *a, **k: FetchResult(
+        status_code=200, final_url="https://www.google.com/search?q=x", html=html, elapsed_ms=1,
+        aio_shown=True, aio_complete=False)})())
+    monkeypatch.setattr("serp.resolve._http_get", lambda url, **k: _Redirect("https://site.example/"))
+    r = engine.search("x", mode="browser", ai_overview=True)
+    assert r.status == "ok" and r.ai_overview and not r.valid and r.problems == ["ai_overview_incomplete"]
+
+
+def test_lite_request_carries_sca_esv(monkeypatch):
+    # Google answers the feature phone page with 403 when sca_esv=1 is missing.
+    sent = {}
+    monkeypatch.setattr(HttpFetcher, "_get", lambda self, url, params, proxy, **k: sent.update(params) or None)
+    HttpFetcher(Config()).fetch_lite("x", DIRECT)
+    assert sent["sca_esv"] == "1" and sent["gl"] == "us" and sent["hl"] == "en"
+
+
+# A desktop page as plain HTTP gets it: the overview's second half is still inside a script,
+# the way Google streams it ("sdh" pieces), one in single quotes, one nested in another piece.
+AIO_START = ('<div><h3>AI Mode replied:</h3><div class="body"><p>Asthma is a long-term lung condition that '
+             'narrows the airways and makes breathing hard.</p><div id="sdh_1"></div></div></div>')
+DEFERRED_PAGE = f"""<html><body><div id="search"><div id="rso">
+<div><a href="https://example.com/asthma"><h3>Asthma</h3></a></div></div></div>{AIO_START}
+<script>[[{{id:'sdh_1'}},function(){{jsl.dh(this.id,"\\x3cp>Common triggers include colds and pollen.\\x3c/p>\\x3cdiv id=\\"sdh_2\\">\\x3c/div>");}}],
+[{{id:'sdh_2'}},function(){{jsl.dh(this.id,'<div role="dialog"><ul><li><a aria-label="Asthma. Opens in new tab." href="/goto?url=abc">Asthma</a> NHS</li></ul></div>');}}]]</script>
+</body></html>"""
+
+
+def test_deferred_pieces_complete_the_overview():
+    plain = parse_serp(DEFERRED_PAGE)
+    assert "triggers" not in plain.ai_overview.text and not plain.ai_overview_complete
+    filled = parse_serp(DEFERRED_PAGE, fill_deferred=True)
+    assert filled.ai_overview_complete
+    assert filled.ai_overview.text.endswith("Common triggers include colds and pollen.")
+    assert [s["url"] for s in filled.ai_overview.sources] == ["https://www.google.com/goto?url=abc"]
+    assert [o.url for o in filled.organic] == ["https://example.com/asthma"]
+
+
+def _hybrid_engine(tmp_path, monkeypatch, html):
+    engine = _engine(tmp_path)
+    sessions = []
+    monkeypatch.setattr(engine, "_browser", type("B", (), {
+        "google_session": lambda self, proxy, fresh=False: sessions.append(proxy) or {"user_agent": "UA", "cookies": {}},
+        "forget_google_session": lambda self, proxy: sessions.append("forgot"),
+        "fetch": lambda *a, **k: FetchResult(200, "https://www.google.com/search?q=x", RESULTS_PAGE, 1, True, True),
+    })())
+    monkeypatch.setattr(engine.http, "fetch_hybrid", _fake(html))
+    monkeypatch.setattr("serp.resolve._http_get", lambda url, **k: _Redirect("https://nhs.example/asthma"))
+    return engine, sessions
+
+
+def test_hybrid_returns_the_complete_overview(tmp_path, monkeypatch):
+    engine, _ = _hybrid_engine(tmp_path, monkeypatch, DEFERRED_PAGE)
+    r = engine.search("asthma", ai_overview=True)
+    assert [a.mode for a in r.attempts] == ["hybrid"] and r.valid
+    assert r.ai_overview.sources == [{"title": "Asthma", "site": "", "url": "https://nhs.example/asthma"}]
+
+
+def test_hybrid_hands_a_cut_off_overview_to_the_browser(tmp_path, monkeypatch):
+    cut_off = DEFERRED_PAGE.split("<script>")[0] + "</body></html>"  # the pieces never arrived
+    engine, _ = _hybrid_engine(tmp_path, monkeypatch, cut_off)
+    r = engine.search("asthma", ai_overview=True)
+    assert [(a.mode, a.outcome) for a in r.attempts] == [("hybrid", "aio_incomplete"), ("browser", "ok")]
+
+
+def test_hybrid_gets_new_cookies_after_google_refuses(tmp_path, monkeypatch):
+    engine, sessions = _hybrid_engine(tmp_path, monkeypatch, JS_PAGE)
+    r = engine.search("asthma", ai_overview=True)
+    assert r.attempts[0].outcome == "js_required" and r.attempts[1].mode == "browser"
+    assert sessions == [DIRECT, "forgot"]
+
+
+def test_real_page_fetched_over_http_gives_the_full_overview():
+    # Saved from a live hybrid-mode run: plain HTTP with Chrome's cookies, no JavaScript run.
+    html = (Path(__file__).parent / "fixtures" / "desktop_2026-09_asthma_children_http.html").read_text()
+    assert classify_block(200, "https://www.google.com/search?q=asthma+in+children", html) is None
+    assert not parse_serp(html).ai_overview_complete  # as sent, half the overview is still in scripts
+    r = parse_serp(html, fill_deferred=True)
+    assert r.ai_overview_complete and len(r.organic) == 8
+    assert len(r.ai_overview.text) == 1425 and len(r.ai_overview.sources) == 9  # same as the browser showed
+    assert r.ai_overview.text.endswith("learn more about specific triggers.")
+
+
+def test_hybrid_starts_resolving_links_while_the_page_downloads(monkeypatch):
+    page = b'<a href="/goto?url=AAAA">A</a> ... jsl.dh(this.id,"\\x3ca href=\\x22/goto?url=BBBB_-9\\x22>")'
+    cut = page.index(b"BBBB") + 2  # the second link arrives split across two chunks
+
+    class Stream:
+        status_code, url, encoding, headers = 200, "https://www.google.com/search?q=x", "utf-8", {}
+        iter_content = lambda self: iter([page[:cut], page[cut:]])
+        close = lambda self: None
+
+    monkeypatch.setattr("serp.fetch_http._http_get", lambda url, **k: Stream())
+    started = []
+    monkeypatch.setattr("serp.fetch_http.start_resolving", lambda url, proxy: started.append(url) or url)
+    got = HttpFetcher(Config()).fetch_hybrid("x", DIRECT, {"user_agent": "UA", "cookies": {}})
+    assert started == ["https://www.google.com/goto?url=AAAA", "https://www.google.com/goto?url=BBBB_-9"]
+    assert set(got.links) == set(started) and got.html == page.decode()

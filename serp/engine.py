@@ -19,9 +19,14 @@ benched for SERP_BLOCK_COOLDOWN seconds, doubled for each further block within
 is benched the search returns status="blocked" (or "throttled" when over the hourly
 cap) without contacting Google.
 
-If Google can't be asked or keeps failing, a saved result up to SERP_STALE_TTL old is
-returned instead, marked stale=True. Identical searches running at the same time
-share one request to Google.
+After a successful fetch, every coded /goto link is followed to its real page (all at
+once, through the same proxy), and the result is checked: valid=True only when it is
+complete (see _problems). Each search is recorded once, apart from its attempts, so the
+stats can report searches, valid rate, first-try rate and p95 time separately.
+
+Caching is off by default (SERP_CACHE_TTL=0, SERP_STALE_TTL=0): every search asks Google.
+When turned on, a saved result up to SERP_STALE_TTL old is returned if Google can't be
+asked, marked stale=True, and identical searches running at the same time share one request.
 """
 
 import json
@@ -29,18 +34,19 @@ import os
 import random
 import threading
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from .config import Config
 from .detect import classify_block
 from .fetch_browser import BrowserFetcher
 from .fetch_http import HttpFetcher, search_params
-from .models import Attempt, SerpResponse
+from .models import Attempt, FetchResult, SerpResponse
 from .parser import parse_serp
 from .proxies import DIRECT, ProxyPool
+from .resolve import is_goto, resolve_links
 from .stats import Stats
 
-MODES = ("auto", "lite", "http", "browser")
+MODES = ("auto", "lite", "http", "hybrid", "browser")
 MODE_RECHECK_S = 6 * 3600
 BLOCK_MEMORY_S = 24 * 3600
 # Outcomes that mean a mode is broken for us right now, not just unlucky once.
@@ -82,8 +88,10 @@ class SerpEngine:
         if mode != "auto":
             return [mode]
         if ai_overview:
-            return ["browser"]
-        return [m for m in ("lite", "http", "browser") if not self._looks_broken(m)]
+            # Hybrid returns the complete overview in one fast request when Google accepts the
+            # reused cookies; if not, or if the overview came back incomplete, the browser takes over.
+            return ["hybrid", "browser"]
+        return [m for m in ("lite", "http", "hybrid", "browser") if not self._looks_broken(m)]
 
     def _looks_broken(self, mode: str) -> bool:
         """True if this mode's latest result in the last few hours was a lasting failure, not a success."""
@@ -136,7 +144,10 @@ class SerpEngine:
         params = search_params(self.cfg, query, start, tbs)
         cache_key = json.dumps([params, mode, ai_overview])
         with self._search_locks[hash(cache_key) % len(self._search_locks)]:
-            return self._search(query, mode, ai_overview, params, cache_key, start, tbs, no_cache)
+            response = self._search(query, mode, ai_overview, params, cache_key, start, tbs, no_cache)
+        if not response.cached or response.stale:
+            self.stats.record_search(response, ai_overview)
+        return response
 
     def _search(self, query, mode, ai_overview, params, cache_key, start, tbs, no_cache) -> SerpResponse:
         begin = time.monotonic()
@@ -172,7 +183,7 @@ class SerpEngine:
                 )
                 break
             with self._ip_locks.setdefault(ProxyPool.label(proxy), threading.Lock()):
-                attempt, parsed = self._attempt(query, current, proxy, ai_overview, start, tbs)
+                attempt, parsed, fetched = self._attempt(query, current, proxy, ai_overview, start, tbs)
             response.attempts.append(attempt)
             if attempt.outcome == "ok":
                 response.status, response.mode = "ok", current
@@ -180,6 +191,9 @@ class SerpEngine:
                 response.people_also_ask = parsed.people_also_ask
                 response.related_searches = parsed.related_searches
                 response.ai_overview = parsed.ai_overview
+                self._resolve(response, proxy, fetched.links)
+                response.problems = self._problems(response, ai_overview, fetched, parsed)
+                response.valid = not response.problems
                 break
 
             if attempt.outcome == "captcha":
@@ -195,6 +209,7 @@ class SerpEngine:
             # Better an older answer than none while Google is off limits.
             stale = SerpResponse.from_dict(old)
             stale.cached = stale.stale = True
+            stale.valid, stale.problems = False, ["stale"]
             # The status still says what happened this time; stale=True says the results are older.
             stale.status, stale.attempts, stale.note = response.status, response.attempts, (
                 f"Showing a saved result from {time.strftime('%Y-%m-%d %H:%M', time.localtime(stale.created_at))} "
@@ -204,16 +219,57 @@ class SerpEngine:
         response.elapsed_ms = int((time.monotonic() - begin) * 1000)
         return response
 
+    def _resolve(self, response: SerpResponse, proxy: str, started: dict) -> None:
+        """Replace coded /goto links with the real page URLs."""
+        sources = response.ai_overview.sources if response.ai_overview else []
+        found = resolve_links([o.url for o in response.organic] + [s["url"] for s in sources], proxy, started)
+        for o in response.organic:
+            o.url = found.get(o.url, o.url)
+            if not o.domain and not is_goto(o.url):
+                o.domain = (urlsplit(o.url).hostname or "").removeprefix("www.")
+        if response.ai_overview:
+            # Two coded links can lead to the same page: keep the first.
+            unique: dict[str, dict] = {}
+            for s in sources:
+                s["url"] = found.get(s["url"], s["url"])
+                unique.setdefault(s["url"], s)
+            response.ai_overview.sources = list(unique.values())
+
+    @staticmethod
+    def _problems(response: SerpResponse, ai_overview: bool, fetched: FetchResult, parsed) -> list[str]:
+        """Why a fetched result is not complete. Empty means valid."""
+        problems = []
+        if not response.organic:
+            problems.append("no_organic_results")
+        unresolved = sum(is_goto(o.url) for o in response.organic)
+        if response.ai_overview:
+            unresolved += sum(is_goto(s["url"]) for s in response.ai_overview.sources)
+            if not response.ai_overview.sources:
+                problems.append("ai_overview_without_sources")
+        if unresolved:
+            problems.append(f"unresolved_links: {unresolved}")
+        if any(not o.title for o in response.organic):
+            problems.append("organic_result_without_title")
+        if ai_overview and fetched.aio_shown and not response.ai_overview:
+            problems.append("ai_overview_shown_but_not_extracted")
+        elif ai_overview and response.ai_overview and (fetched.aio_complete is False or not parsed.ai_overview_complete):
+            # Google was still writing the answer (or its source list is missing): the text may be cut off.
+            problems.append("ai_overview_incomplete")
+        return problems
+
     def _attempt(self, query, mode, proxy, ai_overview, start, tbs):
         """Pace, send one request, classify and parse it, and record the attempt."""
         self._pace(proxy)
         attempt = Attempt(mode=mode, proxy=ProxyPool.label(proxy), outcome="ok", status_code=0, elapsed_ms=0)
-        parsed = None
+        parsed, fetched = None, None
         try:
             if mode == "lite":
                 fetched = self.http.fetch_lite(query, proxy, start, tbs)
             elif mode == "http":
                 fetched = self.http.fetch(query, proxy, start, tbs)
+            elif mode == "hybrid":
+                session = self.browser.google_session(proxy)
+                fetched = self.http.fetch_hybrid(query, proxy, session, start, tbs)
             else:
                 fetched = self.browser.fetch(query, proxy, want_ai_overview=ai_overview, start=start, tbs=tbs)
             attempt.status_code, attempt.elapsed_ms = fetched.status_code, fetched.elapsed_ms
@@ -221,10 +277,15 @@ class SerpEngine:
             self._save_html(fetched.html, mode, block or "ok")
             if block:
                 attempt.outcome = block
+                if mode == "hybrid":
+                    self.browser.forget_google_session(proxy)  # get new cookies next time
             else:
-                parsed = parse_serp(fetched.html)
+                parsed = parse_serp(fetched.html, fill_deferred=(mode == "hybrid"))
                 if not parsed.organic and not parsed.ai_overview:
                     attempt.outcome = "empty_parse"
+                elif mode == "hybrid" and ai_overview and parsed.ai_overview and not parsed.ai_overview_complete:
+                    # The page was fine but the overview is cut off: let the browser finish it.
+                    attempt.outcome = "aio_incomplete"
         except Exception as e:  # network errors, timeouts, browser crashes
             attempt.outcome, attempt.detail = "error", f"{type(e).__name__}: {e}"[:300]
         self.stats.record(
@@ -232,4 +293,4 @@ class SerpEngine:
             n_organic=len(parsed.organic) if parsed else 0,
             has_ai_overview=bool(parsed and parsed.ai_overview),
         )
-        return attempt, parsed
+        return attempt, parsed, fetched

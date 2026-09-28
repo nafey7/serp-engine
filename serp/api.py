@@ -1,6 +1,7 @@
 """HTTP API plus a one-page demo dashboard.
 
-  uvicorn serp.api:app --port 8000
+  serp serve            # http://127.0.0.1:8765
+  POST /serp     {"q": "eczema"}  -> the full result in the same response
   GET /search?q=...&mode=auto&aio=true&start=0&tbs=qdr:w&no_cache=false
   GET /stats
   GET /          (dashboard)
@@ -10,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
 from .engine import MODES, SerpEngine
 from .proxies import DIRECT
@@ -21,6 +23,8 @@ engine: SerpEngine | None = None
 async def lifespan(_app):
     global engine
     engine = SerpEngine()
+    # Chrome starts with the server, so the first search doesn't wait for it.
+    engine.browser.warm_up()
     yield
     engine.close()
 
@@ -40,6 +44,27 @@ def search(
     if mode not in MODES:
         raise HTTPException(400, f"mode must be one of {MODES}")
     return engine.search(q, mode=mode, ai_overview=aio, start=start, tbs=tbs, no_cache=no_cache).to_dict()
+
+
+class SerpRequest(BaseModel):
+    q: str = Field(..., min_length=1)
+    # US English desktop results come from SERP_GL / SERP_HL. The AI Overview is captured
+    # whenever Google shows one, which needs the browser.
+    aio: bool = True
+    mode: str = "auto"
+    start: int = Field(0, ge=0, le=300)
+    tbs: str = ""
+
+
+@app.post("/serp")
+def serp(req: SerpRequest):
+    """Synchronous: the search runs while the caller waits, with no queue and no stored result.
+    Always HTTP 200 for a search that ran; check `status` and `valid` in the body."""
+    if req.mode not in MODES:
+        raise HTTPException(400, f"mode must be one of {MODES}")
+    return engine.search(
+        req.q, mode=req.mode, ai_overview=req.aio, start=req.start, tbs=req.tbs, no_cache=True,
+    ).to_dict()
 
 
 @app.get("/stats")
@@ -189,6 +214,9 @@ h2{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;
 .aio h3 svg{color:var(--accent)}
 .aio p{margin:0 0 10px;color:var(--fg-2);white-space:pre-line}
 .muted{color:var(--muted);font-size:13px}
+.srcs{margin:8px 0 0;padding-left:18px;font-size:13px;color:var(--fg-2)}.srcs li{margin:3px 0}
+.srcs a{color:var(--accent);text-decoration:none;word-break:break-all}.srcs a:hover{text-decoration:underline}
+.probs{margin:0;font-size:13px;color:var(--bad)}
 .results{list-style:none;margin:0;padding:6px}
 .res{display:flex;gap:14px;padding:14px 12px;border-radius:10px;position:relative;transition:background .2s}
 .res:hover{background:var(--surface-2)}
@@ -361,8 +389,15 @@ async function loadStats(){
   if(s.blocked_for_s)h+=`<div class="card tile cool reveal"><div class="tl"><span class="dot bad-bg live"></span>Cooling down</div><div class="big bad" id="cd">${mmss(s.blocked_for_s)}</div><div class="sub">until Google is contacted again</div></div>`;
   if(s.requests_last_hour!=null&&s.max_per_hour){const pct=Math.min(100,s.requests_last_hour/s.max_per_hour*100);
     h+=`<div class="card tile reveal" style="--i:1"><div class="tl">This hour</div><div class="big ${full?'bad':''}">${num('rh',s.requests_last_hour)}<span class="sub" style="font-size:15px;font-weight:500"> / ${s.max_per_hour}</span></div><div class="meter"><i class="${full?'full':''}" data-w="${pct}"></i></div><div class="sub">requests to Google (SERP_MAX_PER_HOUR)</div></div>`}
+  const S=s.searches;
+  if(S&&S.searches){const v=Math.round(S.valid_rate*100),f=Math.round(S.first_try_valid_rate*100);
+    h+=`<div class="card tile reveal" style="--i:1"><div class="tl">Searches</div><div class="big">${num('sv',v,'%')}<span class="sub" style="font-size:15px;font-weight:500"> fully valid</span></div>
+      <div class="kv"><div>searches<b>${S.searches}</b></div><div>valid on first try<b>${f}%</b></div><div>fetch attempts<b>${S.fetch_attempts}</b></div>
+      <div>p50 / p95<b>${S.p50_ms} / ${S.p95_ms} ms</b></div><div>AI Overviews found<b>${S.ai_overview.found} / ${S.ai_overview.searches_asking}</b></div>
+      <div>shown, not extracted<b>${S.ai_overview.shown_but_not_extracted}</b></div></div>
+      <div class="sub">one search can take several fetch attempts; times include retries and link resolving</div></div>`}
   if(modes.length)h+=`<div class="modes">${modes.map(([m,v],i)=>{const r=Math.round(v.success_rate*100),C=2*Math.PI*32,col=r>=80?'var(--good)':r>=40?'var(--warn)':'var(--bad)';
-    return `<div class="card tile mode reveal" style="--i:${i+2}"><div class="name">${esc(m)} mode</div>
+    return `<div class="card tile mode reveal" style="--i:${i+2}"><div class="name">${esc(m)} fetches</div>
       <div class="ring"><svg width="76" height="76"><circle class="bgc" cx="38" cy="38" r="32"/><circle class="fgc" cx="38" cy="38" r="32" stroke="${col}" stroke-dasharray="${C}" stroke-dashoffset="${C}" data-off="${C*(1-r/100)}"/></svg><span>${num('m'+m,r,'%')}</span></div>
       <div class="kv"><div>tries<b>${v.attempts}</b></div><div>avg<b>${v.avg_ms} ms</b></div><div>layout breaks<b>${v.layout_breaks}</b></div></div></div>`}).join('')}</div>`;
   h+=`<div class="card tile reveal" style="--i:${modes.length+2}"><div class="tl">Cached searches</div><div class="big">${num('c',s.cached_searches)}</div><div class="sub">answered without Google</div></div>`;
@@ -399,8 +434,9 @@ $('#f').onsubmit=async e=>{
       :r.cached?`<span class="tag">from cache</span> fetched ${new Date(r.created_at*1000).toLocaleTimeString()} via <b>${esc(r.mode)}</b>`
       :r.mode?`via <b>${esc(r.mode)}</b>`:'';
     const trail=r.cached&&!r.stale||!r.attempts.length?'':`<div class="trail">${r.attempts.map((a,i)=>`${i?'<span class="chev">→</span>':''}<span class="step"><span class="dot ${a.outcome=='ok'?'good':'bad'}-bg"></span><b>${esc(a.mode)}</b>${esc(a.outcome)}<em>${a.elapsed_ms} ms</em></span>`).join('')}</div>`;
-    let i=0,h=`<div class="card status reveal" style="--i:${i++}"><div class="st-top"><span class="badge ${t}"><span class="dot"></span>${esc(r.status)}</span><span class="via">${via}</span><span class="ms">${r.elapsed_ms} ms</span></div>${trail}${r.note?`<p class="note">${esc(r.note)}</p>`:''}</div>`;
-    if(r.ai_overview)h+=`<div class="card aio reveal" style="--i:${i++}"><h3>${ICON.spark}AI Overview</h3><p>${esc(r.ai_overview.text.slice(0,800))}</p><div class="muted">${r.ai_overview.sources.length} sources</div></div>`;
+    let i=0,h=`<div class="card status reveal" style="--i:${i++}"><div class="st-top"><span class="badge ${t}"><span class="dot"></span>${esc(r.status)}</span><span class="via">${via}</span>${r.status=='ok'?`<span class="badge ${r.valid?'good':'bad'}"><span class="dot"></span>${r.valid?'valid':'not valid'}</span>`:''}<span class="ms">${r.elapsed_ms} ms</span></div>${trail}${r.problems&&r.problems.length?`<p class="probs">${esc(r.problems.join(' · '))}</p>`:''}${r.note?`<p class="note">${esc(r.note)}</p>`:''}</div>`;
+    if(r.ai_overview)h+=`<div class="card aio reveal" style="--i:${i++}"><h3>${ICON.spark}AI Overview</h3><p>${esc(r.ai_overview.text)}</p><div class="muted">${r.ai_overview.sources.length} sources</div>
+      <ol class="srcs">${r.ai_overview.sources.map(x=>`<li>${x.site?esc(x.site)+' — ':''}<a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.title||x.url)}</a></li>`).join('')}</ol></div>`;
     if(r.organic.length)h+=`<div class="card"><ol class="results">${r.organic.map(o=>{const name=o.source||o.domain||'';return `<li class="res reveal" style="--i:${i++}"><div class="pos">${o.position||''}</div><div class="rb">
       <div class="src"><span class="av" style="background:${hue(o.domain||name||o.url)}">${esc((o.domain||name||'?').replace(/^www\./,'')[0].toUpperCase())}</span>${name?`<span class="sn">${esc(name)}</span>`:''}<span class="crumb">${esc(o.display_url||o.domain||o.url)}</span></div>
       <a class="rt" href="${esc(o.url)}" target="_blank" rel="noopener noreferrer">${esc(o.title)}${ICON.ext}</a>
