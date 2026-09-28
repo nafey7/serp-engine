@@ -4,7 +4,8 @@
   serp batch queries.txt [--delay 30] [--mode auto] [--aio] [--no-cache] [--out results.jsonl]
   serp stats
   serp serve [--host 127.0.0.1] [--port 8765]
-  serp bench [--modes lite,http,hybrid,browser] [--gap 20] [--queries "a" "b" ...]
+  serp bench [--modes hybrid,browser] [--gap 180] [--queries "a" "b" ...]
+  serp proof "eczema" ["another query" ...]
 """
 
 import argparse
@@ -64,11 +65,19 @@ def main(argv=None) -> None:
     sv = sub.add_parser("serve", help="run the HTTP API and dashboard")
     sv.add_argument("--host", default=os.getenv("SERP_HOST", "127.0.0.1"))
     sv.add_argument("--port", type=int, default=int(os.getenv("SERP_PORT", "8765")))
-    bn = sub.add_parser("bench", help="time each fetch mode on the same searches; results go to docs/benchmarks/")
-    bn.add_argument("--modes", default="lite,http,browser")
-    bn.add_argument("--gap", type=float, default=20.0, help="seconds between searches")
+    bn = sub.add_parser("bench", help="time each fetch mode on the same searches; results go to evidence/")
+    bn.add_argument("--modes", default="hybrid,browser")
+    bn.add_argument("--gap", type=float, default=180.0, help="seconds between searches (180 = 20 an hour)")
     bn.add_argument("--queries", nargs="+")
+    pf = sub.add_parser("proof", help="save result JSON + screenshot + page HTML per query into evidence/")
+    pf.add_argument("queries", nargs="+")
     args = ap.parse_args(argv)
+
+    if args.cmd == "proof":
+        from .proof import run as run_proof
+
+        print(f"\nWrote {run_proof(args.queries)}")
+        return
 
     if args.cmd == "bench":
         from .bench import DEFAULT_QUERIES, run

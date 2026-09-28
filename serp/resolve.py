@@ -10,6 +10,7 @@ the search, so resolving a full page costs about one round trip (~0.5 s). In bro
 mode they start while the page is still loading, which hides most of that time.
 """
 
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from urllib.parse import urljoin, urlsplit
 
@@ -19,6 +20,15 @@ from .proxies import DIRECT
 
 GOTO_PREFIX = "https://www.google.com/goto?"
 _pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="resolve")
+# Each worker thread keeps its own open connection per proxy, so a link after the first
+# skips the ~0.2 s it costs to open a secure connection to Google.
+_local = threading.local()
+
+
+def _http_get(url: str, *, proxy: str, **kwargs):
+    sessions = _local.__dict__.setdefault("sessions", {})
+    session = sessions.get(proxy) or sessions.setdefault(proxy, requests.Session())
+    return session.get(url, proxies=None if proxy == DIRECT else {"http": proxy, "https": proxy}, **kwargs)
 
 
 def is_goto(url: str) -> bool:
@@ -49,13 +59,7 @@ def resolve_links(urls: list[str], proxy: str, started: dict[str, Future] | None
 
 def _resolve_one(url: str, proxy: str, timeout_s: float) -> str | None:
     try:
-        resp = requests.get(
-            url,
-            impersonate="chrome",
-            allow_redirects=False,
-            proxies=None if proxy == DIRECT else {"http": proxy, "https": proxy},
-            timeout=timeout_s,
-        )
+        resp = _http_get(url, proxy=proxy, impersonate="chrome", allow_redirects=False, timeout=timeout_s)
     except Exception:
         return None
     location = resp.headers.get("location", "")

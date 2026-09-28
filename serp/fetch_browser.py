@@ -146,6 +146,28 @@ class BrowserFetcher:
         self._save_session(proxy, ctx.storage_state())
         return {"user_agent": page.evaluate("navigator.userAgent"), "cookies": cookies(), "created": time.time()}
 
+    def capture(self, proxy: str, png_path: str, html_path: str) -> None:
+        """Save what this proxy's tab shows right now (the page of its latest search): a
+        full-page screenshot and the page's HTML. The AI Overview is opened out first
+        ("Show more"), so the screenshot shows all of it; the parsed result is not affected."""
+        def _capture():
+            page = self._tabs[proxy]
+            try:
+                more = page.get_by_role("button", name="Show more").first
+                if more.is_visible():
+                    more.click(timeout=2_000)
+                    page.wait_for_timeout(800)
+            except Exception:
+                pass
+            page.screenshot(path=png_path, full_page=True)
+            with open(html_path, "w") as f:
+                f.write(page.content())
+
+        self._worker.submit(_capture).result()
+
+    def chrome_version(self) -> str:
+        return self._worker.submit(lambda: self._ensure_browser().version).result()
+
     def warm_up(self) -> None:
         """Start Chrome now, so the first search doesn't pay for it. Google is not contacted."""
         self._worker.submit(self._ensure_browser).result()

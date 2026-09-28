@@ -240,7 +240,7 @@ def test_captcha_redirect_is_not_followed(monkeypatch):
         calls.append(url)
         return _Resp(302, "https://www.google.com/wml/search?q=x", location="https://www.google.com/sorry/index?continue=x")
 
-    monkeypatch.setattr("serp.fetch_http.requests.get", fake_get)
+    monkeypatch.setattr("serp.fetch_http._http_get", fake_get)
     got = REAL_GET(HttpFetcher(Config()), "https://www.google.com/wml/search", {"q": "x"}, DIRECT, "chrome")
     assert len(calls) == 1  # the sorry page itself was never loaded
     assert classify_block(got.status_code, got.final_url, got.html) == "captcha"
@@ -249,7 +249,7 @@ def test_captcha_redirect_is_not_followed(monkeypatch):
 def test_other_redirects_are_followed(monkeypatch):
     replies = [_Resp(301, "https://google.com/search?q=x", location="/search?q=x"),
                _Resp(200, "https://www.google.com/search?q=x", text=RESULTS_PAGE)]
-    monkeypatch.setattr("serp.fetch_http.requests.get", lambda url, **k: replies.pop(0))
+    monkeypatch.setattr("serp.fetch_http._http_get", lambda url, **k: replies.pop(0))
     got = REAL_GET(HttpFetcher(Config()), "https://google.com/search", {"q": "x"}, DIRECT, "chrome")
     assert got.status_code == 200 and classify_block(got.status_code, got.final_url, got.html) is None
 
@@ -361,7 +361,7 @@ def test_goto_links_are_resolved_and_result_is_valid(tmp_path, monkeypatch):
         seen.append(url)
         return _Redirect("https://site.example/" + url[-12:])
 
-    monkeypatch.setattr("serp.resolve.requests.get", fake_get)
+    monkeypatch.setattr("serp.resolve._http_get", fake_get)
     r = engine.search("best running shoes", mode="browser", ai_overview=True)
     assert r.status == "ok" and r.valid and r.problems == []
     assert all(o.url.startswith("https://site.example/") and o.domain for o in r.organic)
@@ -372,7 +372,7 @@ def test_goto_links_are_resolved_and_result_is_valid(tmp_path, monkeypatch):
 def test_unresolved_links_make_the_result_not_valid(tmp_path, monkeypatch):
     engine = _engine(tmp_path)
     _browser_page(monkeypatch, engine)
-    monkeypatch.setattr("serp.resolve.requests.get", lambda url, **k: _Redirect("https://www.google.com/sorry/index"))
+    monkeypatch.setattr("serp.resolve._http_get", lambda url, **k: _Redirect("https://www.google.com/sorry/index"))
     r = engine.search("best running shoes", mode="browser", ai_overview=True)
     assert r.status == "ok" and not r.valid
     assert any(p.startswith("unresolved_links: ") for p in r.problems)
@@ -404,7 +404,7 @@ def test_links_started_early_are_not_asked_for_again(monkeypatch):
     from serp.resolve import resolve_links
 
     asked = []
-    monkeypatch.setattr("serp.resolve.requests.get", lambda url, **k: asked.append(url) or _Redirect("https://b.example/"))
+    monkeypatch.setattr("serp.resolve._http_get", lambda url, **k: asked.append(url) or _Redirect("https://b.example/"))
     early = Future()
     early.set_result("https://a.example/")
     a, b = "https://www.google.com/goto?url=A", "https://www.google.com/goto?url=B"
@@ -418,7 +418,7 @@ def test_overview_cut_off_by_the_wait_is_not_valid(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "_browser", type("B", (), {"fetch": lambda *a, **k: FetchResult(
         status_code=200, final_url="https://www.google.com/search?q=x", html=html, elapsed_ms=1,
         aio_shown=True, aio_complete=False)})())
-    monkeypatch.setattr("serp.resolve.requests.get", lambda url, **k: _Redirect("https://site.example/"))
+    monkeypatch.setattr("serp.resolve._http_get", lambda url, **k: _Redirect("https://site.example/"))
     r = engine.search("x", mode="browser", ai_overview=True)
     assert r.status == "ok" and r.ai_overview and not r.valid and r.problems == ["ai_overview_incomplete"]
 
@@ -461,7 +461,7 @@ def _hybrid_engine(tmp_path, monkeypatch, html):
         "fetch": lambda *a, **k: FetchResult(200, "https://www.google.com/search?q=x", RESULTS_PAGE, 1, True, True),
     })())
     monkeypatch.setattr(engine.http, "fetch_hybrid", _fake(html))
-    monkeypatch.setattr("serp.resolve.requests.get", lambda url, **k: _Redirect("https://nhs.example/asthma"))
+    monkeypatch.setattr("serp.resolve._http_get", lambda url, **k: _Redirect("https://nhs.example/asthma"))
     return engine, sessions
 
 
@@ -495,3 +495,20 @@ def test_real_page_fetched_over_http_gives_the_full_overview():
     assert r.ai_overview_complete and len(r.organic) == 8
     assert len(r.ai_overview.text) == 1425 and len(r.ai_overview.sources) == 9  # same as the browser showed
     assert r.ai_overview.text.endswith("learn more about specific triggers.")
+
+
+def test_hybrid_starts_resolving_links_while_the_page_downloads(monkeypatch):
+    page = b'<a href="/goto?url=AAAA">A</a> ... jsl.dh(this.id,"\\x3ca href=\\x22/goto?url=BBBB_-9\\x22>")'
+    cut = page.index(b"BBBB") + 2  # the second link arrives split across two chunks
+
+    class Stream:
+        status_code, url, encoding, headers = 200, "https://www.google.com/search?q=x", "utf-8", {}
+        iter_content = lambda self: iter([page[:cut], page[cut:]])
+        close = lambda self: None
+
+    monkeypatch.setattr("serp.fetch_http._http_get", lambda url, **k: Stream())
+    started = []
+    monkeypatch.setattr("serp.fetch_http.start_resolving", lambda url, proxy: started.append(url) or url)
+    got = HttpFetcher(Config()).fetch_hybrid("x", DIRECT, {"user_agent": "UA", "cookies": {}})
+    assert started == ["https://www.google.com/goto?url=AAAA", "https://www.google.com/goto?url=BBBB_-9"]
+    assert set(got.links) == set(started) and got.html == page.decode()

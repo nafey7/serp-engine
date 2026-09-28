@@ -39,7 +39,8 @@ serp search "how does sourdough work" --aio --json
 serp search "news" --page 2 --tbs qdr:w --no-cache
 serp batch queries.txt --delay 30 --out results.jsonl
 serp stats
-serp bench --modes hybrid,browser   # timings written to docs/benchmarks/
+serp bench --modes hybrid,browser   # timings + test conditions written to evidence/
+serp proof "eczema"                 # result JSON + matching Google screenshot, in evidence/
 ```
 
 ### HTTP API
