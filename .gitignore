@@ -24,6 +24,8 @@ htmlcov/
 
 # Scrape output and saved pages
 results*.jsonl
+# ...except test results kept as evidence
+!evidence/**/results.jsonl
 saved_html/
 
 # Secrets: proxy lists and env files
