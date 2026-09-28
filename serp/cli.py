@@ -3,10 +3,13 @@
   serp search "best running shoes" [--mode auto|lite|http|browser] [--aio] [--page 2] [--tbs qdr:w] [--no-cache] [--json]
   serp batch queries.txt [--delay 30] [--mode auto] [--aio] [--no-cache] [--out results.jsonl]
   serp stats
+  serp serve [--host 127.0.0.1] [--port 8765]
+  serp bench [--modes lite,http,hybrid,browser] [--gap 20] [--queries "a" "b" ...]
 """
 
 import argparse
 import json
+import os
 import random
 import sys
 import time
@@ -19,13 +22,14 @@ def _print_human(r) -> None:
     print(f"\n[{r.status}] {r.query!r}  mode={r.mode}  total={r.elapsed_ms}ms" + ("  (stale)" if r.stale else "  (cached)" if r.cached else ""))
     if r.attempts and (not r.cached or r.stale):
         print(f"  attempts: {trail}")
+    if r.status == "ok":
+        print(f"  valid: {r.valid}" + (f"  problems: {'; '.join(r.problems)}" if r.problems else ""))
     if r.note:
         print(f"  note: {r.note}")
     if r.ai_overview:
         print(f"  AI Overview ({len(r.ai_overview.sources)} sources): {r.ai_overview.text[:300]}...")
     for o in r.organic[:10]:
-        where = o.display_url or o.domain or o.source
-        print(f"  {o.position:>2}. {o.title}\n      {where if o.url.startswith('https://www.google.com/goto') else o.url}")
+        print(f"  {o.position:>2}. {o.title}\n      {o.url}")
     if r.people_also_ask:
         print("  People also ask: " + " | ".join(r.people_also_ask[:4]))
     if r.related_searches:
@@ -55,7 +59,31 @@ def main(argv=None) -> None:
     b.add_argument("--out", default="results.jsonl")
 
     sub.add_parser("stats")
+
+    # 8765 is unused by the other local projects (grona-code, relevic-v2, Nature Treats).
+    sv = sub.add_parser("serve", help="run the HTTP API and dashboard")
+    sv.add_argument("--host", default=os.getenv("SERP_HOST", "127.0.0.1"))
+    sv.add_argument("--port", type=int, default=int(os.getenv("SERP_PORT", "8765")))
+    bn = sub.add_parser("bench", help="time each fetch mode on the same searches; results go to docs/benchmarks/")
+    bn.add_argument("--modes", default="lite,http,browser")
+    bn.add_argument("--gap", type=float, default=20.0, help="seconds between searches")
+    bn.add_argument("--queries", nargs="+")
     args = ap.parse_args(argv)
+
+    if args.cmd == "bench":
+        from .bench import DEFAULT_QUERIES, run
+
+        modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+        if not set(modes) <= {"lite", "http", "hybrid", "browser"}:
+            ap.error("--modes takes lite, http, hybrid and browser")
+        print(f"\nWrote {run(modes, args.queries or list(DEFAULT_QUERIES), args.gap)}")
+        return
+
+    if args.cmd == "serve":
+        import uvicorn
+
+        uvicorn.run("serp.api:app", host=args.host, port=args.port)
+        return
 
     engine = SerpEngine()
     try:

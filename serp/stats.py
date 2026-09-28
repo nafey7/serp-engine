@@ -1,6 +1,11 @@
-"""Records every attempt so success rate, block rate and layout breakage are visible.
+"""Records every search and every attempt, so the numbers that matter are visible.
 
-The same database holds the result cache, so repeated searches don't reach Google.
+A search is one logical query from a caller. It may take several attempts (fetches
+from Google): a retry after a captcha, or a fallback to another mode. Both are kept
+apart: search-level numbers (valid rate, first-try rate, p95 time including retries)
+come from the searches table, fetch-level numbers from the attempts table.
+
+The same database holds the optional result cache (off by default).
 """
 
 import json
@@ -12,6 +17,10 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS attempts (
     ts REAL, query TEXT, mode TEXT, proxy TEXT, outcome TEXT,
     status_code INTEGER, elapsed_ms INTEGER, n_organic INTEGER, has_ai_overview INTEGER
+);
+CREATE TABLE IF NOT EXISTS searches (
+    ts REAL, query TEXT, status TEXT, valid INTEGER, n_attempts INTEGER, elapsed_ms INTEGER,
+    aio_requested INTEGER, has_ai_overview INTEGER, n_sources INTEGER, problems TEXT
 );
 CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, ts REAL, response TEXT);
 """
@@ -33,6 +42,47 @@ class Stats:
                  attempt.status_code, attempt.elapsed_ms, n_organic, int(has_ai_overview)),
             )
             self._db.commit()
+
+    def record_search(self, response, aio_requested: bool) -> None:
+        aio = response.ai_overview
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO searches VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), response.query, response.status, int(response.valid), len(response.attempts),
+                 response.elapsed_ms, int(aio_requested), int(bool(aio)), len(aio.sources) if aio else 0,
+                 "; ".join(response.problems)),
+            )
+            self._db.commit()
+
+    def search_summary(self, since_s: float | None = None) -> dict:
+        """Search-level numbers. Searches answered without contacting Google (every IP
+        blocked or at its hourly cap) count as searches and as not valid, but not toward speed."""
+        where, args = ("WHERE ts > ?", [time.time() - since_s]) if since_s else ("", [])
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT valid, n_attempts, elapsed_ms, aio_requested, has_ai_overview, problems FROM searches {where}",
+                args,
+            ).fetchall()
+        n = len(rows)
+        times = sorted(ms for _, tries, ms, *_ in rows if tries)
+        pct = lambda p: times[min(len(times) - 1, int(p * len(times)))] if times else 0
+        rate = lambda k: round(k / n, 3) if n else 0
+        aio_rows = [r for r in rows if r[3]]
+        return {
+            "searches": n,
+            "valid_rate": rate(sum(r[0] for r in rows)),
+            # Valid on the very first fetch: no retry, no fallback to another mode.
+            "first_try_valid_rate": rate(sum(1 for r in rows if r[0] and r[1] == 1)),
+            "fetch_attempts": sum(r[1] for r in rows),
+            "p50_ms": pct(0.50),
+            "p95_ms": pct(0.95),
+            "ai_overview": {
+                "searches_asking": len(aio_rows),
+                "found": sum(r[4] for r in aio_rows),
+                # Google showed an overview but the parser got nothing: a layout change to fix.
+                "shown_but_not_extracted": sum("ai_overview_shown_but_not_extracted" in r[5] for r in aio_rows),
+            },
+        }
 
     def last_seen(self, outcome: str, since_s: float, mode: str | None = None) -> dict[str, float]:
         """Latest time each proxy got `outcome` within the last `since_s` seconds."""
@@ -122,4 +172,7 @@ class Stats:
             }
             for mode, n, ok, avg, aio, empty in rows
         }
-        return {"by_mode": by_mode, "outcomes": dict(outcomes), "cached_searches": cached}
+        return {
+            "searches": self.search_summary(),
+            "by_mode": by_mode, "outcomes": dict(outcomes), "cached_searches": cached,
+        }

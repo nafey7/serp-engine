@@ -4,7 +4,7 @@
 **Lead source:** Jorge Macias, via a Slack community post (Monday, 2026-09-21, 1:12 AM)
 **Referred by:** Muhammad Ali Mehboob (asked Jorge for an intro on our behalf)
 **Status:** Pre-contract. No warm intro. We email the client directly, citing Jorge. Contact identity and commercial terms not yet confirmed.
-**Last updated:** 2026-09-24
+**Last updated:** 2026-09-25
 
 ---
 
@@ -37,6 +37,7 @@ The client did not contact us. They contacted Jorge Macias's team, who passed on
 | Mon 2026-09-21, 1:12 AM | Jorge, Slack channel | Posted both emails as attachments: "Anyone interested, lmk, happy to pass over an intro. Seems like a crazy technical project + a little sketchy tbh." |
 | Mon 2026-09-21, 1:49 AM | Muhammad Ali Mehboob → Jorge (DM) | "I know a full-stack developer turned GT[M engineer]... good fit for the project. Let me know if you can make [an intro]... deets." |
 | 2026-09-24, 3:41 AM | Jorge | "yeah pass the email and i can make an intro" |
+| 2026-09-24, 5:59 AM | Jorge, Slack channel | "IF anyone interested email him directly: daniel.mercer@infatica.io. website is down and seems a bit sketchy either way, happy hunting". Two checkmark reactions. |
 | 2026-09-24, 6:01 AM | Jorge | "nvm, included their email in the slack message" |
 | 2026-09-24, 10:18 PM | Ali | "Thank youu" |
 
@@ -46,7 +47,8 @@ What this means for us:
 - **Jorge passed on the project.** He called it a "crazy technical project" and "a little sketchy". He is a signal, not an endorsement.
 - **Other vendors likely saw the same post.** The client's first email is a template, and Jorge posted it to a community channel. Expect competing bids.
 - **The client has more detail they have not sent.** Their first email ends: "If relevant, I'll share our current projects and technical requirements." That document should be requested in our first reply.
-- **Neither email shows a sender name** in the screenshots (both end at "Best regards,"). The Daniel Mercer identity comes from Jorge's Slack message, not the emails. Verify before sharing anything sensitive.
+- **Neither email shows a sender name** in the screenshots (both end at "Best regards,"). The Daniel Mercer identity and address come from Jorge's 5:59 AM Slack post, not the emails. Verify before sharing anything sensitive.
+- **At least two other people signalled interest** (checkmark reactions on Jorge's post), so speed matters.
 
 ---
 
@@ -251,7 +253,7 @@ Fast workers    Render workers
 |---|---|
 | Unpaid build phase | Budget is framed as maintenance only. Build work may be unpaid unless negotiated. Payment appears tied to a "stable, working solution", so the build is at our risk. |
 | Low budget vs value | $5k to $7k/month is small relative to the revenue this engine supports and to 50 to 200 servers of ops load. |
-| Contact verification | Jorge called the lead "a little sketchy tbh" and passed on it. The emails shown are unsigned. Earlier notes also record the website being down. Verify the contact is a real Infatica employee before sharing anything sensitive. |
+| Contact verification | Jorge called the lead "a little sketchy tbh" and passed on it, adding "website is down" on 2026-09-24. infatica.io loaded normally on 2026-09-24 when checked, so likely a temporary outage. The emails shown are unsigned. Verify the contact is a real Infatica employee before sharing anything sensitive. |
 | Competing bids | The screening email is a template and was posted to a community channel. Assume several vendors replied. |
 | Cold outreach | No intro from Jorge. Our email must establish credibility on its own. |
 | Google Terms of Service | Scraping Google violates its ToS. Legal gray area, common in the industry. |

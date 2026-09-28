@@ -26,6 +26,8 @@ class Config:
     browser_channel: str = field(default_factory=lambda: os.getenv("SERP_BROWSER_CHANNEL", "chrome"))
     # Google shows headless Chrome a captcha almost every time, so a visible window is the default.
     headless: bool = field(default_factory=lambda: os.getenv("SERP_HEADLESS", "false").lower() == "true")
+    # Don't load images in browser mode: faster, and the text and links don't need them.
+    block_images: bool = field(default_factory=lambda: os.getenv("SERP_BLOCK_IMAGES", "true").lower() == "true")
     timeout_s: int = field(default_factory=lambda: int(os.getenv("SERP_TIMEOUT", "25")))
     max_attempts: int = field(default_factory=lambda: int(os.getenv("SERP_MAX_ATTEMPTS", "3")))
     # After a captcha, leave that IP (or proxy) alone this long. Retrying sooner only extends the block.
@@ -38,11 +40,12 @@ class Config:
     # Most requests one IP may send to Google in any rolling hour. A single IP without proxies
     # typically gets a captcha after 20 to 50 searches, so stop well before that. 0 = no limit.
     max_per_hour: int = field(default_factory=lambda: int(os.getenv("SERP_MAX_PER_HOUR", "20")))
-    # Serve a repeated search from the local cache for this many seconds. 0 = off.
-    cache_ttl_s: int = field(default_factory=lambda: int(os.getenv("SERP_CACHE_TTL", "3600")))
+    # Serve a repeated search from the local cache for this many seconds. 0 = off (the default:
+    # every search asks Google and no result is stored).
+    cache_ttl_s: int = field(default_factory=lambda: int(os.getenv("SERP_CACHE_TTL", "0")))
     # When Google can't be asked (blocked, over the hourly limit, or failing), return a saved result
-    # up to this old instead of nothing, marked stale. 0 = off.
-    stale_ttl_s: int = field(default_factory=lambda: int(os.getenv("SERP_STALE_TTL", str(7 * 86400))))
+    # up to this old instead of nothing, marked stale. 0 = off (the default).
+    stale_ttl_s: int = field(default_factory=lambda: int(os.getenv("SERP_STALE_TTL", "0")))
     # Browser cookies per proxy, kept between runs so each IP looks like a returning visitor.
     # Holds Google session cookies: the folder is created readable by you only.
     session_dir: str = field(

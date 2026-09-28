@@ -7,6 +7,12 @@ Each proxy keeps its own cookies between requests (a "session"), so every
 proxy looks like one consistent person rather than a fresh visitor each time.
 Sessions are saved to SERP_SESSION_DIR (owner-only permissions) and survive restarts.
 
+Each proxy also keeps one open tab between searches, so a search skips setting up
+a fresh browser window. A tab that hits a captcha or breaks is closed and replaced.
+
+Coded /goto links start resolving as soon as they appear on the page, so most are
+done by the time the AI Overview has finished loading.
+
 Playwright's sync API must stay on the thread that started it, so all browser
 work runs on one dedicated worker thread.
 """
@@ -23,12 +29,21 @@ from .config import Config
 from .fetch_http import CONSENT_COOKIES, search_params
 from .models import FetchResult
 from .proxies import DIRECT, ProxyPool
+from .resolve import start_resolving
 
 # Filled with the real browser version: a user agent that disagrees with the browser is a bot signal.
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/{version} Safari/537.36"
 )
+
+
+# True once the AI Overview holds its full source list, which Google adds when the answer is complete.
+_AIO_DONE_JS = """() => {
+  const label = [...document.querySelectorAll('h3')].find(e => e.textContent.includes('AI Mode replied'));
+  const root = label ? label.parentElement : document;
+  return !!root.querySelector('[role=dialog] li, [aria-label="Show less related results"]');
+}"""
 
 
 def _playwright_proxy(proxy: str) -> dict | None:
@@ -48,6 +63,9 @@ class BrowserFetcher:
         self._pw = None
         self._browser = None
         self._sessions: dict[str, dict] = {}  # proxy -> saved cookies/storage
+        self._tabs: dict[str, object] = {}  # proxy -> open tab, kept between searches
+        self._google: dict[str, dict] = {}  # proxy -> cookies + user agent for hybrid mode
+        self._stale_google: set[str] = set()  # proxies whose cookies Google stopped accepting
         self._dir = cfg.session_dir
         os.makedirs(self._dir, mode=0o700, exist_ok=True)
         os.chmod(self._dir, 0o700)
@@ -91,6 +109,47 @@ class BrowserFetcher:
         self._worker.submit(_close).result()
         self._worker.shutdown()
 
+    def google_session(self, proxy: str, fresh: bool = False) -> dict:
+        """Cookies and user agent of this proxy's Chrome tab after it has passed Google's
+        JavaScript check, for hybrid mode to reuse in fast HTTP requests.
+
+        Opening the Google homepage is enough to get them: no search is sent. `fresh` throws
+        the old cookies away first (Google stopped accepting them).
+        """
+        cached = self._google.get(proxy)
+        if cached and not fresh:
+            return cached
+        session = self._worker.submit(self._new_google_session, proxy, fresh).result()
+        self._google[proxy] = session
+        return session
+
+    def forget_google_session(self, proxy: str) -> None:
+        self._google.pop(proxy, None)
+        self._stale_google.add(proxy)
+
+    def _new_google_session(self, proxy: str, fresh: bool) -> dict:
+        page = self._tab(proxy)
+        ctx = page.context
+        if fresh or proxy in self._stale_google:
+            ctx.clear_cookies()
+            ctx.add_cookies(
+                [{"name": k, "value": v, "domain": ".google.com", "path": "/"} for k, v in CONSENT_COOKIES.items()]
+            )
+            self._stale_google.discard(proxy)
+        cookies = lambda: {c["name"]: c["value"] for c in ctx.cookies("https://www.google.com")}
+        if "AEC" not in cookies():
+            page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=self.cfg.timeout_s * 1000)
+            for _ in range(50):  # Google's script sets the cookies shortly after the page loads
+                if "AEC" in cookies():
+                    break
+                page.wait_for_timeout(100)
+        self._save_session(proxy, ctx.storage_state())
+        return {"user_agent": page.evaluate("navigator.userAgent"), "cookies": cookies(), "created": time.time()}
+
+    def warm_up(self) -> None:
+        """Start Chrome now, so the first search doesn't pay for it. Google is not contacted."""
+        self._worker.submit(self._ensure_browser).result()
+
     def _ensure_browser(self):
         if self._browser is None:
             from patchright.sync_api import sync_playwright
@@ -99,11 +158,17 @@ class BrowserFetcher:
             self._browser = self._pw.chromium.launch(
                 headless=self.cfg.headless,
                 channel=self.cfg.browser_channel,
+                # Images are not needed for the text and links; skipping them makes the page load faster.
+                # Chrome's own switch, so no request has to be intercepted.
+                args=["--blink-settings=imagesEnabled=false"] if self.cfg.block_images else [],
             )
         return self._browser
 
-    def _fetch(self, query: str, proxy: str, want_ai_overview: bool, start: int, tbs: str) -> FetchResult:
-        start = time.monotonic()
+    def _tab(self, proxy: str):
+        """The open tab for this proxy, created on first use and kept for the next search."""
+        tab = self._tabs.get(proxy)
+        if tab and not tab.is_closed():
+            return tab
         browser = self._ensure_browser()
         ctx = browser.new_context(
             # Headless Chrome announces itself as "HeadlessChrome"; a visible one needs no override.
@@ -113,12 +178,26 @@ class BrowserFetcher:
             proxy=_playwright_proxy(proxy),
             storage_state=self._load_session(proxy),
         )
+        if proxy not in self._sessions:
+            ctx.add_cookies(
+                [{"name": k, "value": v, "domain": ".google.com", "path": "/"} for k, v in CONSENT_COOKIES.items()]
+            )
+        self._tabs[proxy] = tab = ctx.new_page()
+        return tab
+
+    def _drop_tab(self, proxy: str) -> None:
+        tab = self._tabs.pop(proxy, None)
+        if tab:
+            try:
+                tab.context.close()
+            except Exception:
+                pass
+
+    def _fetch(self, query: str, proxy: str, want_ai_overview: bool, start: int, tbs: str) -> FetchResult:
+        t0 = time.monotonic()
+        links: dict = {}  # coded link -> its resolution, started as soon as the link appears
         try:
-            if proxy not in self._sessions:
-                ctx.add_cookies(
-                    [{"name": k, "value": v, "domain": ".google.com", "path": "/"} for k, v in CONSENT_COOKIES.items()]
-                )
-            page = ctx.new_page()
+            page = self._tab(proxy)
             params = urlencode(search_params(self.cfg, query, start, tbs))
             resp = page.goto(
                 f"https://www.google.com/search?{params}",
@@ -132,21 +211,43 @@ class BrowserFetcher:
             status = resp.status if resp else 0
             if "/sorry/" in page.url and self.cfg.manual_captcha_s and not self.cfg.headless:
                 status = self._wait_for_human(page) or status
-            if want_ai_overview:
-                self._expand_ai_overview(page)
+            blocked = "/sorry/" in page.url
+            if not blocked:
+                self._start_resolving(page, proxy, links)  # organic links resolve while the overview loads
+            aio_shown = aio_complete = None
+            if want_ai_overview and not blocked:
+                aio_shown, aio_complete = self._expand_ai_overview(page, lambda: self._start_resolving(page, proxy, links))
             html = page.content()
-            if "/sorry/" not in page.url:
-                self._save_session(proxy, ctx.storage_state())
+            if not blocked:
+                self._start_resolving(page, proxy, links)
+                self._save_session(proxy, page.context.storage_state())
             else:
                 self._save_session(proxy, None)  # burned session, start fresh next time
+                self._drop_tab(proxy)
             return FetchResult(
                 status_code=status,
                 final_url=page.url,
                 html=html,
-                elapsed_ms=int((time.monotonic() - start) * 1000),
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                aio_shown=aio_shown,
+                aio_complete=aio_complete,
+                links=links,
             )
-        finally:
-            ctx.close()
+        except Exception:
+            self._drop_tab(proxy)  # a crashed or stuck tab is not reused
+            raise
+
+    @staticmethod
+    def _start_resolving(page, proxy: str, links: dict) -> None:
+        """Start resolving every coded link now on the page that isn't being resolved yet."""
+        try:
+            hrefs = page.eval_on_selector_all("a[href^='/goto?']", "els => els.map(e => e.getAttribute('href'))")
+        except Exception:
+            return
+        for href in hrefs:
+            url = "https://www.google.com" + href
+            if url not in links:
+                links[url] = start_resolving(url, proxy)
 
     def _wait_for_human(self, page) -> int | None:
         """Give the person at the keyboard a chance to solve the captcha in the visible window."""
@@ -160,14 +261,25 @@ class BrowserFetcher:
             return None
 
     @staticmethod
-    def _expand_ai_overview(page) -> None:
-        # The AI Overview streams in after the page loads, and is often cut off behind "Show more".
+    def _expand_ai_overview(page, on_tick=lambda: None) -> tuple[bool, bool]:
+        """Wait for the AI Overview to finish. Returns (shown, complete).
+
+        The overview keeps streaming in after the page loads, in chunks up to a second apart,
+        so "the page stopped changing" is not a safe sign that it is done. Google adds the full
+        source list (and its "Show less related results" button) only once the answer is
+        complete, so that is what is waited for. The page already holds the whole text even
+        where Google collapses it behind "Show more", so nothing is clicked.
+        """
         try:
             page.get_by_text("AI Overview", exact=True).first.wait_for(timeout=6_000)
         except Exception:
-            return  # Google did not show one for this query
-        try:
-            page.get_by_role("button", name="Show more").first.click(timeout=2_000)
-            page.wait_for_timeout(1_000)
-        except Exception:
-            pass
+            return False, False
+        for _ in range(50):  # up to ~5 s
+            try:
+                if page.evaluate(_AIO_DONE_JS):
+                    return True, True
+            except Exception:
+                break
+            on_tick()
+            page.wait_for_timeout(100)
+        return True, False

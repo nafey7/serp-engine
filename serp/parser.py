@@ -13,7 +13,7 @@ names SearXNG uses for it. If Google renames them, lite mode reports
 import re
 from urllib.parse import parse_qs, urljoin, urlsplit
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 from .models import AIOverview, OrganicResult, ParsedSerp
 
@@ -25,16 +25,56 @@ AIO_PLACEHOLDERS = (
 )
 
 
-def parse_serp(html: str) -> ParsedSerp:
+def parse_serp(html: str, fill_deferred: bool = False) -> ParsedSerp:
+    """`fill_deferred`: the page came over plain HTTP, so Google's scripts never ran; put the
+    parts they would have inserted (the rest of the AI Overview) in place first."""
     if html.lstrip().startswith("<?xml"):
         html = html.split("?>", 1)[-1]
     soup = BeautifulSoup(html, "lxml")
+    if fill_deferred:
+        _fill_deferred(soup, html)
+    aio_container = _aio_container(soup)
     return ParsedSerp(
         organic=_organic(soup) or _organic_lite(soup),
         people_also_ask=_people_also_ask(soup),
         related_searches=_related_searches(soup),
-        ai_overview=_ai_overview(soup),
+        ai_overview=_ai_overview(aio_container),
+        # Google adds the overview's full source list only once the answer is complete.
+        ai_overview_complete=bool(aio_container and aio_container.select_one(_AIO_DONE)),
     )
+
+
+# Google sends part of the page as HTML inside scripts, and its JavaScript inserts each piece
+# into the element with the given id: [{id:'sdh_...'},function(){jsl.dh(this.id,"\x3cdiv ...")}].
+# The AI Overview arrives this way in chunks ("sdh" = streamed deferred HTML).
+_DEFERRED = re.compile(r"""\{id:'([^']+)'\},function\(\)\{(?:window\.)?jsl\.dh\(this\.id,(["'])((?:\\.|(?!\2)[^\\])*)\2\)""", re.S)
+_JS_ESCAPE = re.compile(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)", re.S)
+_AIO_DONE = '[role=dialog] li, [aria-label="Show less related results"]'
+
+
+def _js_unescape(s: str) -> str:
+    def one(m):
+        e = m.group(1)
+        if e[0] in "xu" and len(e) > 1:
+            return chr(int(e[1:], 16))
+        return {"n": "\n", "t": "\t", "r": "\r"}.get(e, e)
+    return _JS_ESCAPE.sub(one, s)
+
+
+def _fill_deferred(soup: BeautifulSoup, html: str) -> None:
+    pieces = [(m.group(1), _js_unescape(m.group(3))) for m in _DEFERRED.finditer(html)]
+    for _ in range(3):  # a piece can target an element that another piece creates
+        waiting = []
+        for el_id, fragment in pieces:
+            el = soup.find(id=el_id)
+            if el is None:
+                waiting.append((el_id, fragment))
+                continue
+            el.clear()
+            el.append(BeautifulSoup(fragment, "html.parser"))
+        if not waiting or len(waiting) == len(pieces):
+            break
+        pieces = waiting
 
 
 def _clean_url(href: str) -> str | None:
@@ -57,8 +97,7 @@ def _organic(soup: BeautifulSoup) -> list[OrganicResult]:
         if not link:
             continue
         href = link["href"]
-        # Newer pages hide the target behind a coded /goto link; keep it (it redirects when opened).
-        url = urljoin("https://www.google.com", href) if href.startswith("/goto?") else _clean_url(href)
+        url = _link_url(href)
         if not url or url in seen:
             continue
         seen.add(url)
@@ -158,27 +197,111 @@ def _related_searches(soup: BeautifulSoup) -> list[str]:
     return related
 
 
-def _ai_overview(soup: BeautifulSoup) -> AIOverview | None:
+def _aio_container(soup: BeautifulSoup) -> Tag | None:
     # Since 2026 the overview's body sits under a hidden "AI Mode replied:" heading (a
     # screen-reader label). Next to it Google keeps hidden "not available" messages,
-    # which _aio_text drops, so a page without an overview yields too little text.
+    # which are dropped, so a page without an overview yields too little text.
     label = soup.find(lambda t: t.name == "h3" and "AI Mode replied" in t.get_text())
-    container = label.parent if label else _aio_container_by_heading(soup)
+    return label.parent if label else _aio_container_by_heading(soup)
+
+
+def _ai_overview(container: Tag | None) -> AIOverview | None:
     if container is None:
         return None
-    text = _aio_text(container).replace("AI Overview", "", 1).strip()
+    text = _aio_answer(container)
+    if text.startswith("AI Overview"):
+        text = text.removeprefix("AI Overview").lstrip()
     if len(text) < 40:
         return None
-    titles: dict[str, str] = {}  # url -> title, in page order
+    return AIOverview(text=text, sources=_aio_sources(container))
+
+
+def _link_url(href: str) -> str | None:
+    # Newer pages hide the target behind a coded /goto link; the engine follows it to the real page.
+    return urljoin("https://www.google.com", href) if href.startswith("/goto?") else _clean_url(href)
+
+
+# Google marks the parts of the overview that are not the answer in ways that survive its class
+# renames: the source panel and video cards carry data-ignore-copy (Google leaves them out when
+# you copy the answer), and citation chips and "Show more" are buttons.
+_AIO_SKIP = "script, style, svg, button, [data-ignore-copy], [role=dialog]"
+_BLOCK_TAGS = {"div", "p", "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "tr", "pre", "blockquote"}
+
+
+def _aio_answer(container: Tag) -> str:
+    """The overview's answer as plain text: one line per paragraph, heading or list item ("- ")."""
+    body = BeautifulSoup(str(container), "lxml")
+    for el in body.select(_AIO_SKIP):
+        el.decompose()
+    for card in body.select("[role=button]"):
+        img = card.find("img", alt=True)
+        name = img["alt"].strip() if img else ""
+        if img:
+            img.decompose()
+        if name and card.get_text(strip=True):
+            # A product card: keep the product's name, drop price, rating and "Add to list".
+            card.replace_with(body.new_tag("div", string=name))
+        elif card.name == "a" and not name:
+            card.unwrap()  # a clickable term inside a sentence ("sourdough bread")
+        else:
+            card.decompose()  # a source's thumbnail, or a control such as "Show more"
+    lines: list[str] = []
+    _walk(body.body or body, lines, [], inline=False)
+    return "\n".join(lines)
+
+
+def _walk(el: Tag, lines: list[str], cur: list[str], inline: bool) -> None:
+    for child in el.children:
+        if isinstance(child, Comment):
+            continue
+        if isinstance(child, NavigableString):
+            if not _STATE_STRING.search(child) and not any(p in child.lower() for p in AIO_PLACEHOLDERS):
+                cur.append(str(child))
+            continue
+        # A block nested inside inline text (a product name mid-sentence) stays in the sentence.
+        if inline or child.name not in _BLOCK_TAGS:
+            _walk(child, lines, cur, inline=True)
+            continue
+        _flush(lines, cur)
+        start = len(lines)
+        _walk(child, lines, cur, inline=False)
+        _flush(lines, cur)
+        if child.name == "li" and len(lines) > start:
+            lines[start] = "- " + lines[start]
+
+
+def _flush(lines: list[str], cur: list[str]) -> None:
+    line = re.sub(r"\s+", " ", "".join(cur)).strip()
+    # Spaces the markup leaves before punctuation ("works properly .").
+    line = re.sub(r" ([.,;:!?])(?=\s|$)", r"\1", line)
+    if line:
+        lines.append(line)
+    cur.clear()
+
+
+def _aio_sources(container: Tag) -> list[dict]:
+    """Every page the overview cites, in the order of Google's full source list ("Show all")."""
+    sources, seen = [], set()
+    panel = container.select_one("[role=dialog]")
+    for item in panel.select("li") if panel else []:
+        a = item.find("a", href=True)
+        url = _link_url(a["href"]) if a else None
+        if not url or url in seen:
+            continue  # e.g. a Google Shopping card, which links to no page
+        seen.add(url)
+        label = a.get("aria-label", "")
+        title = re.sub(r"(\. Opens in new tab\.|, Video, watch on .*)$", "", label).strip() or a.get_text(" ", strip=True)
+        text = item.get_text(" ", strip=True)
+        site = text.split(title, 1)[0].strip() if title and title in text else ""
+        sources.append({"title": title[:200], "site": site[:100], "url": url})
+    # Links in the answer itself that the list lacks (and older layouts without the list).
     for a in container.find_all("a", href=True):
-        href = a["href"]
-        # Citations are coded /goto links (they redirect to the page when opened).
-        url = urljoin("https://www.google.com", href) if href.startswith("/goto?") else _clean_url(href)
-        if url and not titles.get(url):
-            # An image link has no text; a later link to the same page may supply the name.
-            titles[url] = (a.get("aria-label") or a.get_text(" ", strip=True))[:200]
-    sources = [{"title": title, "url": url} for url, title in titles.items()]
-    return AIOverview(text=text, sources=sources)
+        url = _link_url(a["href"])
+        if url and url not in seen:
+            seen.add(url)
+            name = (a.get("aria-label") or a.get_text(" ", strip=True))[:200]
+            sources.append({"title": name, "site": "", "url": url})
+    return sources
 
 
 def _aio_container_by_heading(soup: BeautifulSoup) -> Tag | None:

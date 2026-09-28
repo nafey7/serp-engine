@@ -5,6 +5,10 @@ browser at the connection level. It cannot run JavaScript.
 
 - "http" asks for the normal desktop page. Google now often answers with a
   "turn on JavaScript" page instead; the engine then moves on to another mode.
+- "hybrid" asks for the normal desktop page too, but with the cookies and user agent
+  of a Chrome tab that has passed Google's JavaScript check (fetch_browser.google_session),
+  so Google serves the real results. The parts Google's scripts would insert later
+  (the rest of the AI Overview) are filled in by the parser.
 - "lite" asks for the page Google still serves to old feature phones
   (/wml/search with a Nokia user agent). It needs no JavaScript, so it usually
   works where "http" doesn't. SearXNG uses the same trick. It has no
@@ -58,21 +62,34 @@ class HttpFetcher:
             impersonate="chrome",
         )
 
+    def fetch_hybrid(self, query: str, proxy: str, session: dict, start: int = 0, tbs: str = "") -> FetchResult:
+        return self._get(
+            "https://www.google.com/search",
+            search_params(self.cfg, query, start, tbs),
+            proxy,
+            impersonate="chrome",
+            headers={"User-Agent": session["user_agent"]},
+            cookies=session["cookies"],
+        )
+
     def fetch_lite(self, query: str, proxy: str, start: int = 0, tbs: str = "") -> FetchResult:
         return self._get(
             "https://www.google.com/wml/search",
-            {**search_params(self.cfg, query, start, tbs), "ie": "utf8", "oe": "utf8"},
+            # Without sca_esv=1 Google answers this page with 403 Forbidden (tested 2026-09-28;
+            # SearXNG sends it too). It does not narrow the results, unlike SearXNG's lr/cr.
+            {**search_params(self.cfg, query, start, tbs), "sca_esv": "1", "ie": "utf8", "oe": "utf8"},
             proxy,
             impersonate="chrome99_android",
             headers={"User-Agent": random.choice(NOKIA_USER_AGENTS), "Accept": "*/*"},
         )
 
-    def _get(self, url: str, params: dict, proxy: str, impersonate: str, headers: dict | None = None) -> FetchResult:
+    def _get(self, url: str, params: dict, proxy: str, impersonate: str, headers: dict | None = None,
+             cookies: dict | None = None) -> FetchResult:
         start = time.monotonic()
         kwargs = dict(
             impersonate=impersonate,
             headers=headers,
-            cookies=CONSENT_COOKIES,
+            cookies=cookies or CONSENT_COOKIES,
             proxies=None if proxy == DIRECT else {"http": proxy, "https": proxy},
             timeout=self.cfg.timeout_s,
         )
