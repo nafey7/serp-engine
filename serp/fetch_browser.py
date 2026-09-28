@@ -38,6 +38,21 @@ USER_AGENT = (
 )
 
 
+# True when an AI Overview is on its way. Google sends the start of the overview with the page,
+# under a hidden screen-reader heading "AI Mode replied:", so the heading is there as soon as the
+# results are (checked on live searches, 2026-09-29: present at results time on every overview
+# search, never present on searches without one). A visible "AI Overview" heading also counts, for
+# older layouts without the hidden one. Hidden "AI Overview is not available" placeholders on pages
+# without an overview are not visible, so they don't count.
+_AIO_COMING_JS = """() => {
+  if ([...document.querySelectorAll('h3')].some(e => e.textContent.includes('AI Mode replied'))) return true;
+  return [...document.querySelectorAll('div, span, h1, h2, strong')].some(
+    e => e.textContent.trim() === 'AI Overview' && e.getClientRects().length > 0);
+}"""
+# How long to keep checking for the heading after the results appear. It was always there at once in
+# testing; this only covers a heading that arrives a moment late.
+AIO_SIGNAL_WAIT_MS = 500
+
 # True once the AI Overview holds its full source list, which Google adds when the answer is complete.
 _AIO_DONE_JS = """() => {
   const label = [...document.querySelectorAll('h3')].find(e => e.textContent.includes('AI Mode replied'));
@@ -286,16 +301,26 @@ class BrowserFetcher:
     def _expand_ai_overview(page, on_tick=lambda: None) -> tuple[bool, bool]:
         """Wait for the AI Overview to finish. Returns (shown, complete).
 
+        Whether one is coming is read from the page right after the results appear
+        (_AIO_COMING_JS), so a search without an overview returns within AIO_SIGNAL_WAIT_MS
+        instead of waiting out a timeout for a heading that never appears.
+
         The overview keeps streaming in after the page loads, in chunks up to a second apart,
         so "the page stopped changing" is not a safe sign that it is done. Google adds the full
         source list (and its "Show less related results" button) only once the answer is
         complete, so that is what is waited for. The page already holds the whole text even
         where Google collapses it behind "Show more", so nothing is clicked.
         """
-        try:
-            page.get_by_text("AI Overview", exact=True).first.wait_for(timeout=6_000)
-        except Exception:
-            return False, False
+        for waited in range(0, AIO_SIGNAL_WAIT_MS + 1, 100):
+            try:
+                if page.evaluate(_AIO_COMING_JS):
+                    break
+            except Exception:
+                return False, False
+            if waited < AIO_SIGNAL_WAIT_MS:
+                page.wait_for_timeout(100)
+        else:
+            return False, False  # no overview on this page
         for _ in range(50):  # up to ~5 s
             try:
                 if page.evaluate(_AIO_DONE_JS):

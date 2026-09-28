@@ -512,3 +512,53 @@ def test_hybrid_starts_resolving_links_while_the_page_downloads(monkeypatch):
     got = HttpFetcher(Config()).fetch_hybrid("x", DIRECT, {"user_agent": "UA", "cookies": {}})
     assert started == ["https://www.google.com/goto?url=AAAA", "https://www.google.com/goto?url=BBBB_-9"]
     assert set(got.links) == set(started) and got.html == page.decode()
+
+
+class _FakePage:
+    """Stands in for a browser tab: answers the overview checks from a script of page states."""
+
+    def __init__(self, coming_after_ms=None, done_after_ms=None):
+        self.coming_after_ms, self.done_after_ms, self.ms = coming_after_ms, done_after_ms, 0
+
+    def evaluate(self, js):
+        from serp.fetch_browser import _AIO_COMING_JS, _AIO_DONE_JS
+
+        after = {_AIO_COMING_JS: self.coming_after_ms, _AIO_DONE_JS: self.done_after_ms}[js]
+        return after is not None and self.ms >= after
+
+    def wait_for_timeout(self, ms):
+        self.ms += ms
+
+    def get_by_text(self, *a, **k):
+        raise AssertionError("must not wait for the visible heading")
+
+
+def test_search_without_overview_returns_at_once():
+    from serp.fetch_browser import AIO_SIGNAL_WAIT_MS, BrowserFetcher
+
+    page = _FakePage()  # Google shows no overview
+    assert BrowserFetcher._expand_ai_overview(page) == (False, False)
+    assert page.ms == AIO_SIGNAL_WAIT_MS <= 500  # was a 6 s timeout
+
+
+def test_overview_is_still_waited_for_until_complete():
+    from serp.fetch_browser import BrowserFetcher
+
+    page = _FakePage(coming_after_ms=0, done_after_ms=900)  # label at once, sources after 0.9 s
+    ticks = []
+    assert BrowserFetcher._expand_ai_overview(page, lambda: ticks.append(1)) == (True, True)
+    assert page.ms == 900 and ticks  # links kept resolving while waiting
+
+
+def test_overview_heading_that_arrives_a_moment_late_is_caught():
+    from serp.fetch_browser import BrowserFetcher
+
+    assert BrowserFetcher._expand_ai_overview(_FakePage(coming_after_ms=300, done_after_ms=1000)) == (True, True)
+
+
+def test_overview_that_never_finishes_is_reported_incomplete():
+    from serp.fetch_browser import BrowserFetcher
+
+    page = _FakePage(coming_after_ms=0)
+    assert BrowserFetcher._expand_ai_overview(page) == (True, False)
+    assert page.ms == 5000
