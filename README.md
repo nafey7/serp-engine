@@ -2,6 +2,13 @@
 
 A Google search results (SERP) scraper. It tries fast, cheap HTTP requests first and falls back to a real browser when needed, for example to capture Google AI Overviews.
 
+## Screenshots
+
+<p>
+  <img src="docs/screenshots/dashboard-ai-overview.jpg" alt="Demo dashboard: a search with its captured AI Overview and per-mode health stats" width="49%">
+  <img src="docs/screenshots/dashboard-results.jpg" alt="Demo dashboard: parsed organic results with real URLs" width="49%">
+</p>
+
 ## Features
 
 - **Five fetch modes:** `lite` (feature-phone page), `http` (desktop page), `hybrid` (desktop page over plain HTTP, reusing a Chrome tab's Google cookies; the rest of the AI Overview is filled in from the page's scripts), `browser` (real Chrome via Patchright), and `auto`. With the AI Overview wanted, `auto` tries hybrid, then the browser.
